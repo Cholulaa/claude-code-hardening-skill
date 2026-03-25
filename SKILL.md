@@ -69,14 +69,28 @@ which nginx apache2 httpd caddy 2>/dev/null
 nginx -v 2>&1; apache2 -v 2>&1; httpd -v 2>&1
 
 # Database detection
-which mysql psql mongod redis-server 2>/dev/null
-systemctl is-active mysql postgresql mongod redis 2>/dev/null
+which mysql psql mongod redis-server redis-cli elasticsearch 2>/dev/null
+systemctl is-active mysql postgresql mongod redis redis-server elasticsearch 2>/dev/null
+
+# Mail server detection
+which postfix sendmail dovecot 2>/dev/null
+systemctl is-active postfix sendmail dovecot 2>/dev/null
 
 # Application frameworks
 which node python3 java php ruby go 2>/dev/null
 
 # Cron jobs (user's scheduled tasks)
 crontab -l 2>/dev/null; ls /etc/cron.d/ 2>/dev/null
+
+# Desktop vs Server detection
+if [ -n "$XDG_CURRENT_DESKTOP" ] || [ -n "$DESKTOP_SESSION" ] || systemctl is-active display-manager &>/dev/null; then
+  echo "DESKTOP ENVIRONMENT DETECTED"
+else
+  echo "SERVER MODE"
+fi
+
+# Browser detection (impacts /dev/shm noexec)
+which firefox chromium chrome brave 2>/dev/null
 ```
 
 ### 0.3 Current Security Posture
@@ -87,14 +101,26 @@ iptables -L -n 2>/dev/null; ufw status 2>/dev/null
 # SSH config
 sshd -T 2>/dev/null | grep -E "permitrootlogin|passwordauth|x11forwarding|maxauthtries"
 
+# SSH audit (if ssh-audit is available or install it)
+ssh-audit localhost 2>/dev/null | head -20
+
 # Existing security tools
 which fail2ban-client lynis rkhunter clamdscan auditctl aide 2>/dev/null
 
 # AppArmor / SELinux status
 aa-status 2>/dev/null; getenforce 2>/dev/null
 
+# Sudo configuration audit
+grep -r "NOPASSWD" /etc/sudoers /etc/sudoers.d/ 2>/dev/null
+
 # Users with shell access
 grep -v '/nologin\|/false' /etc/passwd | grep -v '^#'
+
+# Pending security updates
+apt list --upgradable 2>/dev/null | grep -i security | head -10
+
+# NTP sync status
+timedatectl status 2>/dev/null | grep -E "synchronized|NTP"
 ```
 
 ### 0.4 Service Impact Analysis
@@ -157,10 +183,23 @@ apt-get install -y -qq \
   apt-transport-https ca-certificates curl software-properties-common
 ```
 
+Also install from pip if available (STANDARD+):
+```bash
+pip3 install ssh-audit testssl.sh 2>/dev/null || true
+# Or from apt if packaged
+apt-get install -y -qq ssh-audit 2>/dev/null || true
+```
+
 ### Enhanced level (adds to standard):
 ```bash
 apt-get install -y -qq openscap-scanner scap-security-guide \
   osquery 2>/dev/null || true
+# Docker Bench for Security (if Docker detected)
+if command -v docker &>/dev/null; then
+  docker run --rm --net host --pid host --userns host --cap-add audit_control \
+    -v /etc:/etc:ro -v /var/lib:/var/lib:ro -v /var/run/docker.sock:/var/run/docker.sock:ro \
+    docker/docker-bench-security 2>/dev/null || true
+fi
 ```
 
 ### Paranoid level (adds to enhanced):
@@ -331,6 +370,48 @@ systemctl enable sysstat && systemctl start sysstat
 
 ### Logwatch
 Configure `/etc/logwatch/conf/logwatch.conf` with `Detail = High`.
+
+### NTP Time Synchronization (ALL LEVELS)
+Accurate time is critical for logs, TLS certificates, TOTP 2FA, and Kerberos.
+```bash
+timedatectl set-ntp true
+systemctl enable systemd-timesyncd
+systemctl start systemd-timesyncd
+timedatectl status
+```
+
+### Shared Memory Hardening (STANDARD+)
+Secure `/dev/shm` to prevent shared memory attacks:
+```bash
+# Check if browsers are installed (JIT needs exec on /dev/shm)
+if command -v firefox &>/dev/null || command -v chromium &>/dev/null || command -v google-chrome &>/dev/null; then
+  # Desktop with browsers: apply nosuid,nodev only (preserve JIT)
+  echo "tmpfs /dev/shm tmpfs defaults,nosuid,nodev 0 0" >> /etc/fstab
+else
+  # Server: full lockdown with noexec
+  echo "tmpfs /dev/shm tmpfs defaults,nosuid,nodev,noexec 0 0" >> /etc/fstab
+fi
+mount -o remount /dev/shm
+```
+
+### Sudo Hardening (STANDARD+)
+```bash
+# Audit dangerous NOPASSWD entries
+grep -r "NOPASSWD" /etc/sudoers /etc/sudoers.d/ 2>/dev/null
+# Add secure defaults
+echo 'Defaults use_pty' >> /etc/sudoers.d/hardening
+echo 'Defaults logfile="/var/log/sudo.log"' >> /etc/sudoers.d/hardening
+echo 'Defaults !visiblepw' >> /etc/sudoers.d/hardening
+echo 'Defaults timestamp_timeout=5' >> /etc/sudoers.d/hardening
+chmod 440 /etc/sudoers.d/hardening
+visudo -c  # ALWAYS validate
+```
+
+### Remove Dangerous Packages (STANDARD+)
+```bash
+# Remove insecure legacy services if present
+apt-get purge -y -qq telnet rsh-client rsh-server xinetd 2>/dev/null || true
+```
 
 ---
 
@@ -595,6 +676,105 @@ Generate a structured report:
 
 ---
 
+## PHASE 16: Post-Hardening Health Verification (ALL LEVELS)
+
+After ALL hardening is complete, verify nothing is broken:
+
+```bash
+echo "=== HEALTH CHECK ==="
+
+# 1. SSH still accessible
+echo -n "SSH: "; systemctl is-active ssh && echo "OK" || echo "BROKEN"
+
+# 2. Web server (if was running before)
+echo -n "Nginx: "; systemctl is-active nginx 2>/dev/null && echo "OK" || echo "N/A"
+echo -n "Apache: "; systemctl is-active apache2 2>/dev/null && echo "OK" || echo "N/A"
+
+# 3. Docker (if was running before)
+echo -n "Docker: "; docker ps &>/dev/null && echo "OK" || echo "N/A"
+
+# 4. DNS resolution
+echo -n "DNS: "; host google.com &>/dev/null && echo "OK" || echo "BROKEN"
+
+# 5. Firewall active
+echo -n "Firewall: "; ufw status | grep -q "active" && echo "OK" || echo "BROKEN"
+
+# 6. Fail2ban running
+echo -n "Fail2ban: "; fail2ban-client status &>/dev/null && echo "OK" || echo "BROKEN"
+
+# 7. Auditd running
+echo -n "Auditd: "; systemctl is-active auditd && echo "OK" || echo "N/A"
+
+# 8. All services from Phase 0 still running
+# (compare against the list captured in Phase 0)
+```
+
+If ANY critical service is broken, investigate and fix immediately. Report status to user.
+
+---
+
+## Troubleshooting
+
+### Common Issues and Fixes
+
+| Problem | Cause | Fix |
+|---------|-------|-----|
+| SSH connection refused | SSH config error | `sshd -t` then fix config, `systemctl restart ssh` |
+| Website down after hardening | UFW blocking port | `ufw allow 80/tcp && ufw allow 443/tcp` |
+| Docker containers can't reach internet | ip_forward disabled | `sysctl net.ipv4.ip_forward=1` |
+| Browser crashes (desktop) | /dev/shm noexec | Remount without noexec: `mount -o remount,exec /dev/shm` |
+| Database unreachable | Firewall blocking localhost | `ufw allow from 127.0.0.1` |
+| Service won't start after systemd hardening | Too restrictive sandboxing | Remove override: `rm /etc/systemd/system/<svc>.d/hardening.conf && systemctl daemon-reload` |
+| Can't install packages | Audit rules immutable | Reboot to clear immutable audit rules, or `auditctl -e 0` |
+| Fail2ban not banning | Wrong log path in jail | Check `fail2ban-client status <jail>` and fix logpath |
+| NTP not syncing | Firewall blocking UDP 123 | `ufw allow out 123/udp` |
+
+### Emergency Recovery
+If you're locked out or something is critically broken:
+1. Access via console (not SSH) if available
+2. Boot into recovery/single-user mode
+3. Restore backups from `/etc/*.backup.*` files
+4. Disable UFW: `ufw disable`
+5. Restart SSH: `systemctl restart ssh`
+
+---
+
+## Quick Reference
+
+### Files Modified by This Skill
+
+| File | Purpose | Backed Up |
+|------|---------|-----------|
+| `/etc/ssh/sshd_config.d/hardening.conf` | SSH hardening | Yes |
+| `/etc/sysctl.d/99-security-hardening.conf` | Kernel params | New file |
+| `/etc/fail2ban/jail.local` | Fail2ban jails | New file |
+| `/etc/audit/rules.d/hardening.rules` | Audit rules | New file |
+| `/etc/modprobe.d/hardening.conf` | Disabled modules | New file |
+| `/etc/security/pwquality.conf` | Password policy | Yes |
+| `/etc/security/limits.d/hardening.conf` | Core dumps | New file |
+| `/etc/login.defs` | Login policy | Yes |
+| `/etc/issue.net`, `/etc/issue` | Warning banners | Yes |
+| `/etc/nginx/conf.d/security-headers.conf` | Web headers | New file |
+| `/etc/apt/apt.conf.d/50unattended-upgrades` | Auto-updates | Yes |
+| `/etc/cron.d/security-scans` | Scan schedule | New file |
+| `/etc/sudoers.d/hardening` | Sudo policy | New file |
+
+### Services Enabled by This Skill
+
+| Service | Purpose |
+|---------|---------|
+| `fail2ban` | Brute-force protection |
+| `auditd` | System audit logging |
+| `clamav-daemon` | Antivirus |
+| `clamav-freshclam` | Virus DB updates |
+| `psad` | Port scan detection |
+| `acct` | Process accounting |
+| `sysstat` | System statistics |
+| `ufw` | Firewall |
+| `apparmor` | Mandatory access control |
+
+---
+
 ## Safety Rules (NON-NEGOTIABLE)
 
 1. **ALWAYS** run Phase 0 (reconnaissance) FIRST — understand before acting
@@ -602,12 +782,14 @@ Generate a structured report:
 3. **NEVER** lock out SSH access
 4. **NEVER** disable a service without asking the user
 5. **ALWAYS** backup configs before modifying: `cp file file.backup.$(date +%Y%m%d)`
-6. **ALWAYS** validate configs before reloading: `sshd -t`, `nginx -t`, `named-checkconf`, etc.
+6. **ALWAYS** validate configs before reloading: `sshd -t`, `nginx -t`, `visudo -c`, etc.
 7. **ALWAYS** test services after systemd hardening — roll back if broken
 8. If Docker is running: preserve `ip_forward`, don't break Docker networking
 9. If a database is running: don't block its port on localhost
-10. Use `DEBIAN_FRONTEND=noninteractive` for all apt commands
-11. Run long scans (AIDE, ClamAV) in background
-12. Use TaskCreate/TaskUpdate to track progress
-13. Report to the user at each phase completion
-14. If any phase fails, log the error and continue to the next phase — never abort entirely
+10. If browsers are detected (desktop): don't add `noexec` to `/dev/shm`
+11. Use `DEBIAN_FRONTEND=noninteractive` for all apt commands
+12. Run long scans (AIDE, ClamAV) in background
+13. Use TaskCreate/TaskUpdate to track progress
+14. Report to the user at each phase completion
+15. If any phase fails, log the error and continue to the next phase — never abort entirely
+16. **ALWAYS** run Phase 16 (health verification) after hardening to confirm nothing is broken
