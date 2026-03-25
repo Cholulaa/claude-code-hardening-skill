@@ -1,56 +1,132 @@
 ---
 name: hardening
-description: "Complete security hardening of a Linux server. Installs and configures all open-source security tools, hardens SSH/kernel/firewall/permissions, runs all security scans, and generates a full report. Use when the user wants to secure a machine."
+description: "Complete security hardening of a Linux server based on CIS Benchmarks, NIST 800-123, and ANSSI BP-028. Smart service discovery to avoid disruption. 4 hardening levels (minimal/standard/enhanced/paranoid). Installs open-source security tools, hardens SSH/kernel/firewall/systemd/permissions, runs all scans, generates a compliance report."
 user-invocable: true
 disable-model-invocation: true
 allowed-tools: Bash, Read, Write, Edit, Grep, Glob, Agent, TaskCreate, TaskUpdate
-argument-hint: "[full|scan-only|report]"
+argument-hint: "[minimal|standard|enhanced|paranoid|scan-only|report]"
 effort: max
 ---
 
 # Linux Server Security Hardening Skill
+## Based on CIS Benchmarks, NIST SP 800-123, ANSSI BP-028 v2.0 & DevSec Hardening Framework
 
-You are performing a **complete security hardening** of a Linux server. Follow ALL phases below in order. Be systematic, thorough, and never skip a step.
-
-## Arguments
-
-- `$ARGUMENTS` can be:
-  - **full** (default if empty): Run complete hardening + install tools + scan + report
-  - **scan-only**: Skip hardening, only run all security scans and generate report
-  - **report**: Only generate a status report of current security posture (no changes)
+You are performing a **security hardening** of a Linux server. You MUST be systematic, intelligent, and non-disruptive. Follow ALL phases in order.
 
 ---
 
-## PHASE 0: Reconnaissance
+## Hardening Levels (inspired by ANSSI BP-028)
 
-Before making ANY changes, gather system information:
+| Level | Argument | Description | Use Case |
+|-------|----------|-------------|----------|
+| **Minimal** | `minimal` | Essential security baseline. Quick, low risk. | Dev servers, temporary VMs |
+| **Standard** | `standard` or empty | Full hardening with all tools. Balanced. | Production servers, web apps |
+| **Enhanced** | `enhanced` | Aggressive hardening + systemd sandboxing + advanced kernel params. | Exposed servers, compliance (PCI-DSS, HIPAA) |
+| **Paranoid** | `paranoid` | Maximum lockdown. Kernel lockdown, restricted /proc, seccomp everywhere. May break some apps. | High-security, sensitive data, military-grade |
 
+Special modes:
+- **scan-only**: Run all security scans and generate report (no changes)
+- **report**: Status report of current security posture (no changes)
+
+`$ARGUMENTS` determines the level. Default is `standard` if empty.
+
+---
+
+## PHASE 0: Smart Reconnaissance & Service Discovery (ALL LEVELS)
+
+**This is the most critical phase. NEVER skip it.**
+
+Before making ANY changes, perform a complete system audit:
+
+### 0.1 System Information
 ```bash
-# Run ALL of these and save the output mentally
 cat /etc/os-release
 uname -a
 whoami
-df -h /
+hostname -f
+df -h
 free -h
 nproc
-systemctl list-units --type=service --state=running
-ss -tlnp
-iptables -L -n
-cat /etc/ssh/sshd_config 2>/dev/null | grep -v '^#' | grep -v '^$'
+uptime
 ```
 
-Report the current state to the user before proceeding. Identify:
-- OS and version
-- Running services (especially SSH, web servers, databases)
-- Open ports
-- Current firewall state
-- Any existing security tools
+### 0.2 Running Services & Applications Discovery
+```bash
+# All running services
+systemctl list-units --type=service --state=running
 
-**IMPORTANT**: Identify services that MUST remain accessible (SSH, web server, etc.) and preserve their connectivity throughout the hardening process.
+# All listening ports with process names
+ss -tlnp
+
+# All established connections
+ss -tnp state established
+
+# Docker containers if Docker is present
+docker ps 2>/dev/null
+
+# Web server detection
+which nginx apache2 httpd caddy 2>/dev/null
+nginx -v 2>&1; apache2 -v 2>&1; httpd -v 2>&1
+
+# Database detection
+which mysql psql mongod redis-server 2>/dev/null
+systemctl is-active mysql postgresql mongod redis 2>/dev/null
+
+# Application frameworks
+which node python3 java php ruby go 2>/dev/null
+
+# Cron jobs (user's scheduled tasks)
+crontab -l 2>/dev/null; ls /etc/cron.d/ 2>/dev/null
+```
+
+### 0.3 Current Security Posture
+```bash
+# Current firewall
+iptables -L -n 2>/dev/null; ufw status 2>/dev/null
+
+# SSH config
+sshd -T 2>/dev/null | grep -E "permitrootlogin|passwordauth|x11forwarding|maxauthtries"
+
+# Existing security tools
+which fail2ban-client lynis rkhunter clamdscan auditctl aide 2>/dev/null
+
+# AppArmor / SELinux status
+aa-status 2>/dev/null; getenforce 2>/dev/null
+
+# Users with shell access
+grep -v '/nologin\|/false' /etc/passwd | grep -v '^#'
+```
+
+### 0.4 Service Impact Analysis
+
+**CRITICAL: Present findings to the user BEFORE proceeding.**
+
+Generate a service impact table:
+
+```
+## Services detectes sur cette machine
+
+| Service | Port | Process | Impact potentiel du hardening |
+|---------|------|---------|-------------------------------|
+| SSH     | 22   | sshd    | Config modifiee, acces preserve |
+| Nginx   | 80   | nginx   | Headers ajoutes, TLS durci |
+| Docker  | -    | dockerd | ip_forward preserve |
+| ...     | ...  | ...     | ... |
+
+## Services qui DOIVENT rester accessibles:
+- [list]
+
+## Services a desactiver potentiellement:
+- [list — ASK USER before disabling]
+```
+
+**ASK the user**: "Voici les services detectes. Y a-t-il des services que je ne dois PAS toucher ou des ports supplementaires a ouvrir dans le firewall?"
+
+Wait for user response before proceeding to Phase 1. If the user says to continue without changes, proceed.
 
 ---
 
-## PHASE 1: System Update
+## PHASE 1: System Update (ALL LEVELS)
 
 ```bash
 export DEBIAN_FRONTEND=noninteractive
@@ -60,99 +136,161 @@ apt-get upgrade -y -qq
 
 ---
 
-## PHASE 2: Install ALL Security Tools
+## PHASE 2: Install Security Tools (ALL LEVELS)
 
-Install in one batch to minimize time:
-
+### Minimal level:
 ```bash
-export DEBIAN_FRONTEND=noninteractive
+apt-get install -y -qq fail2ban ufw unattended-upgrades apt-listchanges \
+  libpam-pwquality needrestart debsums
+```
+
+### Standard level (adds to minimal):
+```bash
 apt-get install -y -qq \
-  fail2ban ufw auditd audispd-plugins \
-  rkhunter chkrootkit lynis \
-  clamav clamav-daemon clamav-freshclam \
-  aide \
+  auditd audispd-plugins rkhunter chkrootkit lynis \
+  clamav clamav-daemon clamav-freshclam aide \
   apparmor apparmor-utils apparmor-profiles apparmor-profiles-extra \
-  libpam-pwquality libpam-tmpdir \
-  acct sysstat \
-  net-tools arpwatch \
-  logwatch \
-  needrestart debsums apt-show-versions \
-  unattended-upgrades apt-listchanges \
-  psad \
-  firejail \
-  openssh-server nmap nikto \
-  tcpdump wireshark-common tshark \
-  htop iotop iftop \
-  secure-delete \
-  gnupg2 \
-  certbot \
+  libpam-tmpdir acct sysstat net-tools arpwatch logwatch \
+  psad firejail openssh-server nmap nikto john \
+  tcpdump wireshark-common tshark htop iotop iftop \
+  secure-delete gnupg2 certbot \
   apt-transport-https ca-certificates curl software-properties-common
 ```
 
-If `apt-listchanges` or `tiger` or `tripwire` fail, skip them and continue.
+### Enhanced level (adds to standard):
+```bash
+apt-get install -y -qq openscap-scanner scap-security-guide \
+  osquery 2>/dev/null || true
+```
+
+### Paranoid level (adds to enhanced):
+```bash
+apt-get install -y -qq \
+  libseccomp-dev seccomp bpftool 2>/dev/null || true
+```
+
+If any package fails, log it and continue. Never abort for a missing package.
 
 ---
 
-## PHASE 3: SSH Hardening
+## PHASE 3: SSH Hardening (ALL LEVELS)
 
-1. **Backup** existing config: `cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup.$(date +%Y%m%d)`
-2. **Create** `/etc/ssh/sshd_config.d/hardening.conf` with the template from `${CLAUDE_SKILL_DIR}/templates/sshd_hardening.conf`
+1. **Backup**: `cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup.$(date +%Y%m%d)`
+2. **Create** `/etc/ssh/sshd_config.d/hardening.conf` from `${CLAUDE_SKILL_DIR}/templates/sshd_hardening.conf`
+
+### Level-specific adjustments:
+
+**Minimal**: Only set `PasswordAuthentication no`, `PermitRootLogin prohibit-password`, `MaxAuthTries 4`
+
+**Standard**: Full template (Protocol 2, key-only, strong ciphers, disable forwarding, logging VERBOSE)
+
+**Enhanced**: Add `AllowUsers` or `AllowGroups` restriction (ask user), enable 2FA recommendation
+
+**Paranoid**: Set `PermitRootLogin no` (require non-root user + sudo), `MaxSessions 2`, `LoginGraceTime 20`
+
 3. **Create** warning banners in `/etc/issue.net` and `/etc/issue`
-4. **Validate**: `sshd -t` — if it fails, fix the config before proceeding
-5. **Reload**: `systemctl reload ssh` (try `ssh` first, then `sshd` if not found)
+4. **Validate**: `sshd -t` — MUST pass before reload
+5. **Reload**: `systemctl reload ssh`
 
-**CRITICAL**: Never lock out the current SSH session. Keep `PermitRootLogin prohibit-password` (key-based root login). Do NOT change the SSH port unless the user explicitly asks.
-
----
-
-## PHASE 4: Kernel Hardening (sysctl)
-
-Create `/etc/sysctl.d/99-security-hardening.conf` with the template from `${CLAUDE_SKILL_DIR}/templates/sysctl_hardening.conf`
-
-**IMPORTANT**: If Docker is running, do NOT disable `net.ipv4.ip_forward`. Comment it out with a note.
-
-Apply with: `sysctl --system`
-Verify key values: `sysctl net.ipv4.tcp_syncookies net.ipv4.conf.all.rp_filter kernel.randomize_va_space kernel.dmesg_restrict kernel.kptr_restrict`
+**CRITICAL**: NEVER lock out the current SSH session.
 
 ---
 
-## PHASE 5: Firewall (UFW)
+## PHASE 4: Kernel Hardening via sysctl (STANDARD+)
 
+Create `/etc/sysctl.d/99-security-hardening.conf` from `${CLAUDE_SKILL_DIR}/templates/sysctl_hardening.conf`
+
+### Level-specific additions:
+
+**Enhanced** — add:
+```
+# Enhanced: restrict ASLR entropy
+vm.mmap_rnd_bits = 32
+vm.mmap_rnd_compat_bits = 16
+# Disable SACK (CVE-2019-11477)
+net.ipv4.tcp_sack = 0
+# Disable kexec
+kernel.kexec_load_disabled = 1
+# Restrict TTY line discipline
+dev.tty.ldisc_autoload = 0
+# Restrict userfaultfd
+vm.unprivileged_userfaultfd = 0
+```
+
+**Paranoid** — add:
+```
+# Paranoid: full ICMP block
+net.ipv4.icmp_echo_ignore_all = 1
+# Disable all printk
+kernel.printk = 3 3 3 3
+```
+
+**IMPORTANT**: If Docker is running, do NOT disable `net.ipv4.ip_forward`.
+
+Apply: `sysctl --system`
+Verify: `sysctl net.ipv4.tcp_syncookies net.ipv4.conf.all.rp_filter kernel.randomize_va_space kernel.dmesg_restrict`
+
+---
+
+## PHASE 5: Firewall (ALL LEVELS)
+
+### Minimal:
+```bash
+ufw default deny incoming
+ufw default allow outgoing
+ufw limit ssh comment 'SSH rate-limited'
+# Add rules for services detected in Phase 0
+ufw --force enable
+```
+
+### Standard+:
 ```bash
 ufw --force reset
 ufw default deny incoming
 ufw default allow outgoing
 ufw limit ssh comment 'SSH rate-limited'
-ufw allow 80/tcp comment 'HTTP'
-ufw allow 443/tcp comment 'HTTPS'
 ufw logging medium
+# Add rules for services detected in Phase 0 (HTTP, HTTPS, etc.)
 ufw --force enable
 ```
 
-**IMPORTANT**: If other services need public access (detected in Phase 0), add rules for them too. Always `limit` SSH, never just `allow`.
+### Paranoid:
+- Default deny OUTGOING too, then whitelist: DNS (53), HTTP/S (80/443), NTP (123)
+- Enable HIGH logging
+
+**CRITICAL**: Always add rules for services detected in Phase 0 BEFORE enabling the firewall.
 
 ---
 
-## PHASE 6: Fail2ban
+## PHASE 6: Fail2ban (ALL LEVELS)
 
-Create `/etc/fail2ban/jail.local` with the template from `${CLAUDE_SKILL_DIR}/templates/fail2ban_jail.conf`
+### Minimal: SSH jail only
+### Standard: Create `/etc/fail2ban/jail.local` from `${CLAUDE_SKILL_DIR}/templates/fail2ban_jail.conf`
+### Enhanced/Paranoid: Add custom filters for detected applications (PostgreSQL, MySQL, phpMyAdmin, WordPress, etc.)
 
-Then:
+Progressive ban policy (all levels):
+- `bantime.increment = true`
+- `bantime.factor = 2`
+- `bantime.maxtime = 604800` (7 days)
+- Recidive jail for repeat offenders
+
 ```bash
-systemctl enable fail2ban
-systemctl restart fail2ban
+systemctl enable fail2ban && systemctl restart fail2ban
 fail2ban-client status
 ```
 
-If `sshd-ddos` filter doesn't exist, remove that jail from the config.
-
 ---
 
-## PHASE 7: Auditd Rules
+## PHASE 7: Auditd Rules (STANDARD+)
 
-Create `/etc/audit/rules.d/hardening.rules` with the template from `${CLAUDE_SKILL_DIR}/templates/audit_rules.conf`
+Create `/etc/audit/rules.d/hardening.rules` from `${CLAUDE_SKILL_DIR}/templates/audit_rules.conf`
 
-Load rules:
+### Enhanced/Paranoid additions:
+- Monitor all privileged command executions:
+  `find / -xdev -type f \( -perm -4000 -o -perm -2000 \) | while read f; do echo "-a always,exit -F path=$f -F perm=x -F auid>=1000 -F auid!=4294967295 -k privileged"; done`
+- Monitor `/etc/` entirely: `-w /etc/ -p wa -k etc_changes`
+- Immutable rules: `-e 2` (requires reboot to modify)
+
 ```bash
 augenrules --load
 auditctl -l | wc -l
@@ -160,7 +298,7 @@ auditctl -l | wc -l
 
 ---
 
-## PHASE 8: Configure Security Tools
+## PHASE 8: Configure Security Tools (STANDARD+)
 
 ### ClamAV
 ```bash
@@ -170,29 +308,20 @@ systemctl enable clamav-freshclam && systemctl start clamav-freshclam
 systemctl enable clamav-daemon && systemctl start clamav-daemon
 ```
 
-### AIDE
+### AIDE (run in background — slow)
 ```bash
-aideinit  # Run in background - takes a long time
-cp /var/lib/aide/aide.db.new /var/lib/aide/aide.db
+aideinit &
+# Later: cp /var/lib/aide/aide.db.new /var/lib/aide/aide.db
 ```
 
 ### rkhunter
 ```bash
-rkhunter --update
-rkhunter --propupd
+rkhunter --update && rkhunter --propupd
 ```
-Create `/etc/rkhunter.conf.local`:
-```
-UPDATE_MIRRORS=1
-MIRRORS_MODE=0
-WEB_CMD=""
-PKGMGR=DPKG
-ALLOW_SSH_ROOT_USER=prohibit-password
-ALLOW_SSH_PROT_V1=0
-```
+Create `/etc/rkhunter.conf.local` with appropriate ALLOW_SSH settings.
 
 ### PSAD
-Configure hostname and enable auto-IDS in `/etc/psad/psad.conf`. If `ENABLE_AUTO_IDS_REGEX` is missing, add it.
+Configure hostname and auto-IDS in `/etc/psad/psad.conf`.
 
 ### Process accounting & sysstat
 ```bash
@@ -200,11 +329,14 @@ systemctl enable acct && systemctl start acct
 systemctl enable sysstat && systemctl start sysstat
 ```
 
+### Logwatch
+Configure `/etc/logwatch/conf/logwatch.conf` with `Detail = High`.
+
 ---
 
-## PHASE 9: File & Permission Hardening
+## PHASE 9: File & Permission Hardening (ALL LEVELS)
 
-### Critical file permissions
+### 9.1 Critical file permissions (ALL)
 ```bash
 chmod 600 /etc/shadow /etc/gshadow
 chmod 644 /etc/passwd /etc/group
@@ -216,24 +348,32 @@ chmod 600 /boot/grub/grub.cfg 2>/dev/null
 chmod 700 /root
 ```
 
-### Restrict cron and at
+### 9.2 Restrict cron/at (STANDARD+)
 ```bash
 echo "root" > /etc/cron.allow
 echo "root" > /etc/at.allow
 chmod 600 /etc/cron.allow /etc/at.allow
 ```
 
-### Disable core dumps
-Create `/etc/security/limits.d/hardening.conf`:
+### 9.3 Disable core dumps (STANDARD+)
+```bash
+echo "* hard core 0" >> /etc/security/limits.d/hardening.conf
+echo "* soft core 0" >> /etc/security/limits.d/hardening.conf
 ```
-* hard core 0
-* soft core 0
+Systemd: create `/etc/systemd/coredump.conf.d/disable.conf`:
+```
+[Coredump]
+Storage=none
+ProcessSizeMax=0
 ```
 
-### Password policy
-Create `/etc/security/pwquality.conf` with strong settings (minlen=14, require upper/lower/digit/special).
+### 9.4 Password policy (ALL)
+`/etc/security/pwquality.conf`:
+- **Minimal**: minlen=12, minclass=2
+- **Standard**: minlen=14, minclass=3, dcredit=-1, ucredit=-1, ocredit=-1, lcredit=-1
+- **Enhanced/Paranoid**: minlen=16, minclass=4, maxrepeat=2, dictcheck=1, enforcing=1
 
-### login.defs hardening
+### 9.5 login.defs (STANDARD+)
 ```
 PASS_MAX_DAYS   90
 PASS_MIN_DAYS   7
@@ -241,143 +381,233 @@ PASS_WARN_AGE   14
 UMASK           027
 LOGIN_RETRIES   3
 LOGIN_TIMEOUT   60
+SHA_CRYPT_MIN_ROUNDS  10000
 ```
 
-### Disable unnecessary kernel modules
-Create `/etc/modprobe.d/hardening.conf` to blacklist: dccp, sctp, rds, tipc, cramfs, freevxfs, jffs2, hfs, hfsplus, udf, and uncommon network protocols.
+### 9.6 Disable unnecessary kernel modules (STANDARD+)
+Create `/etc/modprobe.d/hardening.conf` from `${CLAUDE_SKILL_DIR}/templates/modprobe_hardening.conf`
 
-### Automatic security updates
-Configure `/etc/apt/apt.conf.d/50unattended-upgrades` and `/etc/apt/apt.conf.d/20auto-upgrades`.
+### 9.7 Automatic security updates (ALL)
+Configure unattended-upgrades for security-only patches.
+
+### 9.8 Restrict /proc visibility (PARANOID)
+Add to `/etc/fstab`: `proc /proc proc defaults,hidepid=2,gid=adm 0 0`
+
+### 9.9 UMASK hardening (ENHANCED+)
+Set `umask 0077` in `/etc/profile` and `/etc/bash.bashrc`
+
+### 9.10 Restrict compiler access (ENHANCED+)
+```bash
+chmod 700 /usr/bin/gcc* /usr/bin/g++* /usr/bin/cc* /usr/bin/make 2>/dev/null
+```
 
 ---
 
-## PHASE 10: Web Server Hardening (if Nginx/Apache detected)
+## PHASE 10: Systemd Service Hardening (ENHANCED+)
 
-If Nginx is present:
-1. Set `server_tokens off;` in `nginx.conf`
-2. Remove TLSv1 and TLSv1.1, keep only TLSv1.2 and TLSv1.3
-3. Set strong SSL ciphers
-4. Create `/etc/nginx/conf.d/security-headers.conf` with:
-   - X-Frame-Options: SAMEORIGIN
-   - X-Content-Type-Options: nosniff
-   - X-XSS-Protection: 1; mode=block
-   - Referrer-Policy: strict-origin-when-cross-origin
-   - Permissions-Policy
-   - Content-Security-Policy
-   - Strict-Transport-Security (HSTS)
+For each running service detected in Phase 0, analyze and harden using systemd security directives.
+
+### 10.1 Audit current exposure
+```bash
+for svc in $(systemctl list-units --type=service --state=running --no-legend | awk '{print $1}'); do
+  echo "=== $svc ==="
+  systemd-analyze security "$svc" 2>/dev/null | tail -1
+done
+```
+
+### 10.2 Create override files for exposed services
+For services with exposure > 5.0, create `/etc/systemd/system/<service>.d/hardening.conf`:
+
+```ini
+[Service]
+# Filesystem isolation
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectHostname=yes
+ProtectClock=yes
+
+# Privilege restriction
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+# Memory protection
+MemoryDenyWriteExecute=yes
+
+# Namespace restriction
+RestrictNamespaces=yes
+RestrictRealtime=yes
+
+# Capability restriction (adapt per service)
+CapabilityBoundingSet=~CAP_SYS_ADMIN CAP_SYS_PTRACE CAP_NET_ADMIN
+
+# Network restriction (if no network needed)
+# PrivateNetwork=yes
+# IPAddressDeny=any
+
+# Syscall filtering
+SystemCallArchitectures=native
+```
+
+**IMPORTANT**: Test each service after hardening. Roll back if the service fails.
+
+```bash
+systemctl daemon-reload
+systemctl restart <service>
+systemctl status <service>  # Verify it's running
+```
+
+---
+
+## PHASE 11: Web Server Hardening (if detected)
+
+### 11.1 Nginx
+1. `server_tokens off;`
+2. Remove TLSv1/1.1, keep only TLSv1.2+
+3. Strong ciphers (ECDHE + CHACHA20/AES-GCM only)
+4. Security headers from `${CLAUDE_SKILL_DIR}/templates/nginx_security_headers.conf`
 5. Test with `nginx -t` and reload
+6. If domain exists, offer Let's Encrypt setup
 
-If Certbot is installed and a domain is configured, offer to set up HTTPS.
+### 11.2 Apache (if detected)
+1. `ServerTokens Prod` and `ServerSignature Off`
+2. Disable directory listing: `Options -Indexes`
+3. Same headers and TLS config as Nginx
+4. Disable unnecessary modules: `a2dismod status info`
 
----
-
-## PHASE 11: Automated Scans (Cron)
-
-Create `/etc/cron.d/security-scans`:
-```
-# ClamAV full scan weekly (Sunday 2 AM)
-0 2 * * 0 root clamscan -r / --exclude-dir="^/sys" --exclude-dir="^/proc" --exclude-dir="^/dev" --exclude-dir="^/run" --quiet --infected --log=/var/log/clamav/weekly-scan.log
-
-# rkhunter daily (3 AM)
-0 3 * * * root /usr/bin/rkhunter --check --skip-keypress --quiet --report-warnings-only --logfile /var/log/rkhunter.log
-
-# chkrootkit weekly (Monday 3:30 AM)
-30 3 * * 1 root /usr/sbin/chkrootkit -q > /var/log/chkrootkit.log 2>&1
-
-# Lynis monthly (1st, 4 AM)
-0 4 1 * * root /usr/sbin/lynis audit system --cronjob --quiet > /var/log/lynis-audit.log 2>&1
-
-# AIDE daily (5 AM)
-0 5 * * * root /usr/bin/aide --check > /var/log/aide/aide-check.log 2>&1
-
-# Security updates check (6 AM)
-0 6 * * * root /usr/bin/apt-get update -qq && /usr/bin/apt-get -s upgrade 2>/dev/null | grep -i "security" > /var/log/security-updates.log
-
-# Logwatch daily (7 AM)
-0 7 * * * root /usr/sbin/logwatch --output file --filename /var/log/logwatch/daily-report.log --detail High
-```
-
-Create necessary log directories: `/var/log/aide`, `/var/log/logwatch`, `/var/log/clamav`.
+### 11.3 Application-specific (if detected)
+- **PHP**: `expose_php = Off`, `display_errors = Off`, `session.cookie_secure = 1`, `session.cookie_httponly = 1`
+- **Node.js**: Recommend helmet.js, check for outdated npm packages
+- **Database**: Ensure not listening on 0.0.0.0, require authentication
 
 ---
 
-## PHASE 12: Run ALL Security Scans
+## PHASE 12: Advanced Hardening (PARANOID only)
 
-Run these scans **in parallel** where possible:
+### 12.1 Boot security
+- GRUB password: `grub-mkpasswd-pbkdf2` and configure in `/etc/grub.d/40_custom`
+- Kernel boot parameters: add `slab_nomerge init_on_alloc=1 init_on_free=1 page_alloc.shuffle=1 pti=on randomize_kstack_offset=on vsyscall=none debugfs=off lockdown=confidentiality module.sig_enforce=1`
 
+### 12.2 Mount hardening
+Add `noexec,nosuid,nodev` to `/tmp`, `/var/tmp`, `/dev/shm` in `/etc/fstab`
+
+### 12.3 USB protection
+```bash
+echo "install usb-storage /bin/false" >> /etc/modprobe.d/hardening.conf
+```
+
+### 12.4 Restrict /boot and kernel info
+```bash
+chmod 700 /boot
+chmod 700 /usr/src 2>/dev/null
+rm -f /boot/System.map-* 2>/dev/null
+```
+
+### 12.5 PAM advanced hardening
+- Add `pam_faildelay.so delay=4000000` for 4-second login delay
+- Increase shadow hashing rounds: `SHA_CRYPT_MIN_ROUNDS 65536` in login.defs
+
+### 12.6 Kernel lockdown
+If `lockdown=confidentiality` is not already in boot params, recommend it.
+
+---
+
+## PHASE 13: Automated Scans (STANDARD+)
+
+Create `/etc/cron.d/security-scans` with scanning schedule:
+- ClamAV: weekly (Sunday 2 AM)
+- rkhunter: daily (3 AM)
+- chkrootkit: weekly (Monday 3:30 AM)
+- Lynis: monthly (1st, 4 AM)
+- AIDE: daily (5 AM)
+- Security updates check: daily (6 AM)
+- Logwatch: daily (7 AM)
+
+Create log directories: `/var/log/aide`, `/var/log/logwatch`, `/var/log/clamav`
+
+---
+
+## PHASE 14: Run ALL Security Scans (ALL LEVELS)
+
+Run in parallel:
 1. **Lynis**: `lynis audit system --cronjob`
 2. **rkhunter**: `rkhunter --check --skip-keypress --report-warnings-only`
 3. **chkrootkit**: `chkrootkit`
 4. **ClamAV**: `clamscan -r /etc /usr/bin /usr/sbin /usr/local/bin /root /home /tmp --infected --quiet`
 5. **Nmap**: `nmap -sV -sS -O --top-ports 1000 localhost`
-6. **Nikto**: `nikto -h http://localhost -C all -nointeractive` (only if web server detected)
+6. **Nikto**: `nikto -h http://localhost -C all -nointeractive` (if web server)
 7. **debsums**: `debsums -s`
-8. **John the Ripper**: Quick password audit on /etc/shadow
+8. **John the Ripper**: Quick password audit
+9. **systemd-analyze security**: All services exposure (ENHANCED+)
+10. **SUID/SGID/World-writable/Unowned file audit**
+11. **Network audit**: listening ports + established connections
 
-Wait for ALL scans to complete before generating the report.
+Wait for ALL scans to complete.
 
 ---
 
-## PHASE 13: Generate Security Report
+## PHASE 15: Generate Comprehensive Security Report
 
-Generate a comprehensive report with this exact structure:
+Generate a structured report:
 
-```
-# RAPPORT DE SECURITE COMPLET - [HOSTNAME]
+```markdown
+# RAPPORT DE SECURITE - [HOSTNAME]
 **Date**: [DATE] | **OS**: [OS] | **Kernel**: [KERNEL]
+**Niveau de hardening**: [LEVEL] | **Reference**: CIS Benchmark + NIST 800-123 + ANSSI BP-028
 
-## 1. LYNIS - Score: XX/100
-- Warnings list
-- Key suggestions
+## Score Global
+| Metrique | Valeur |
+|----------|--------|
+| Lynis Hardening Index | XX/100 |
+| Services securises (systemd) | X/Y |
+| Regles audit actives | XX |
+| Jails fail2ban | XX |
 
+## 1. LYNIS - Audit Global
 ## 2. CLAMAV - Antivirus
-- Malware found: X
-- Suspicious items: X
+## 3. RKHUNTER + CHKROOTKIT - Rootkits
+## 4. NMAP - Ports ouverts
+## 5. NIKTO - Vulnerabilites web
+## 6. DEBSUMS - Integrite paquets
+## 7. JOHN - Audit mots de passe
+## 8. SYSTEMD - Exposition services (ENHANCED+)
+## 9. Audit reseau (ports, connexions)
+## 10. Audit fichiers (SUID, world-writable, unowned)
 
-## 3. RKHUNTER - Rootkits
-- Rootkits found: X
-- Warnings (with analysis of false positives)
+## CONFORMITE
+| Standard | Couverture estimee |
+|----------|-------------------|
+| CIS Benchmark L1 | XX% |
+| NIST 800-123 | XX% |
+| ANSSI BP-028 [level] | XX% |
 
-## 4. CHKROOTKIT - Rootkits (2nd opinion)
-- Rootkits found: X
-
-## 5. NMAP - Port Scan
-- Table of open ports with services
-
-## 6. NIKTO - Web Vulnerabilities
-- Findings
-
-## 7. DEBSUMS - Package Integrity
-- Corrupted packages
-
-## 8. JOHN - Password Audit
-- Weak passwords found
-
-## 9. Network Audit
-- Listening ports table
-- Established connections
-
-## 10. File Audit
-- SUID/SGID files
-- World-writable files
-- Unowned files
-
-## RESUME GLOBAL
-Table with all categories, status, and scores.
-
-## ACTIONS RECOMMANDEES
-Prioritized list of remaining actions.
+## ACTIONS RECOMMANDEES (prioritisees)
+1. [CRITIQUE] ...
+2. [IMPORTANT] ...
+3. [RECOMMANDE] ...
 ```
 
 ---
 
-## Rules
+## Safety Rules (NON-NEGOTIABLE)
 
-- ALWAYS use `export DEBIAN_FRONTEND=noninteractive` before apt commands
-- NEVER lock out SSH access
-- ALWAYS backup configs before modifying them
-- ALWAYS validate configs before reloading services (sshd -t, nginx -t, etc.)
-- If Docker is running, preserve ip_forward and don't break Docker networking
-- Run long scans (AIDE init, ClamAV) in background when possible
-- Use TaskCreate/TaskUpdate to track progress through phases
-- Report to the user at each phase completion
+1. **ALWAYS** run Phase 0 (reconnaissance) FIRST — understand before acting
+2. **ALWAYS** ask the user about detected services before Phase 5 (firewall)
+3. **NEVER** lock out SSH access
+4. **NEVER** disable a service without asking the user
+5. **ALWAYS** backup configs before modifying: `cp file file.backup.$(date +%Y%m%d)`
+6. **ALWAYS** validate configs before reloading: `sshd -t`, `nginx -t`, `named-checkconf`, etc.
+7. **ALWAYS** test services after systemd hardening — roll back if broken
+8. If Docker is running: preserve `ip_forward`, don't break Docker networking
+9. If a database is running: don't block its port on localhost
+10. Use `DEBIAN_FRONTEND=noninteractive` for all apt commands
+11. Run long scans (AIDE, ClamAV) in background
+12. Use TaskCreate/TaskUpdate to track progress
+13. Report to the user at each phase completion
+14. If any phase fails, log the error and continue to the next phase — never abort entirely
